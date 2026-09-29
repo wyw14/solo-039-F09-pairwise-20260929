@@ -41,3 +41,19 @@ func (r ShutdownResult) Error() error {
 }
 
 func (r ShutdownResult) Safe() bool { return r.Depressurized && r.SteamClosed && r.Error() == nil }
+
+// Failure 用简短名称标识停机中未恢复的环节，供事故复核引用。
+func (r ShutdownResult) Failure() string {
+	switch {
+	case r.ReliefError != nil:
+		return "relief"
+	case r.SteamError != nil:
+		return "steam"
+	case !r.Depressurized:
+		return "depressurization"
+	case !r.SteamClosed:
+		return "steam-closure"
+	default:
+		return ""
+	}
+}

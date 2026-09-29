@@ -46,3 +46,11 @@ func (c *Coordinator) Release(lease model.Lease) {
 }
 
 func (c *Coordinator) Used() float64 { c.mu.Lock(); defer c.mu.Unlock(); return c.used }
+
+func (c *Coordinator) Capacity() float64 { c.mu.Lock(); defer c.mu.Unlock(); return c.capacity }
+
+func (c *Coordinator) Available() float64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.capacity - c.used
+}

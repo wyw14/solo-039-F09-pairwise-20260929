@@ -26,3 +26,5 @@ func (r *Route) Close() { r.open = false }
 func (r *Route) Opened() bool { return r.open }
 
 func (r *Route) Target() string { return r.target }
+
+func (r *Route) Revision() string { return r.revision }

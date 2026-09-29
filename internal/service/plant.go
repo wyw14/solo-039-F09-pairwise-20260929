@@ -119,7 +119,7 @@ func (p *Plant) Start(ctx context.Context, grade, source string) (model.Campaign
 	p.CampaignHistory.Record(before, current, "start grade selected")
 	if err := p.Feed.Switch(ctx, source, current); err != nil {
 		operationErr = err
-		p.fail(err)
+		p.reportOperation(err, "feed", Operation{Kind: OpFeedSwitch, Detail: source})
 		return model.Campaign{}, err
 	}
 	p.Column.SetFeedRevision(p.Feed.Current.Revision)
@@ -154,7 +154,7 @@ func (p *Plant) Transition(ctx context.Context, grade, source string) (model.Cam
 	campaign.Restore(p.Campaign, current)
 	p.CampaignHistory.Record(before, current, "grade transition")
 	if err := p.Feed.Switch(ctx, source, current); err != nil {
-		p.fail(err)
+		p.reportOperation(err, "feed", Operation{Kind: OpFeedSwitch, Detail: source})
 		return model.Campaign{}, err
 	}
 	p.Column.SetFeedRevision(p.Feed.Current.Revision)
@@ -187,12 +187,15 @@ func (p *Plant) RouteProduct(target string) error {
 	current := p.Campaign.Snapshot()
 	proof, ok := p.Analyzer.Proof(current.Revision)
 	if !ok {
-		return errors.New("composition evidence is incomplete")
+		err := errors.New("composition evidence is incomplete")
+		p.reportOperation(err, "product-route", Operation{Kind: OpProductRoute, Detail: target})
+		return err
 	}
 	_ = p.Evidence.Add(proof)
 	pressureProof := model.Proof{ID: uuid.New(), Revision: current.Revision, Source: "column-pressure", Digest: fmt.Sprintf("%.3f", p.Column.Snapshot().Pressure), Durable: true, Independent: true, At: time.Now().Unix()}
 	permit := p.Interlock.Evaluate([]model.Proof{proof, pressureProof}, model.Campaign{ID: current.ID, Revision: current.Revision, Phase: model.OnSpec, Epoch: current.Epoch, Fencing: current.Fencing})
 	if err := permit.Error(); err != nil {
+		p.reportOperation(err, "product-route", Operation{Kind: OpProductRoute, Detail: target})
 		return err
 	}
 	current.Phase = model.OnSpec
@@ -200,7 +203,7 @@ func (p *Plant) RouteProduct(target string) error {
 	plan := model.ProductPlan{Campaign: current.ID, Revision: current.Revision, Grade: current.Grade, Target: target}
 	if err := p.Product.PublishWithProof(plan, proof); err != nil {
 		p.ProductAudit.Record(plan, proof, false, err.Error())
-		p.fail(err)
+		p.reportOperation(err, "product-route", Operation{Kind: OpProductRoute, Detail: target})
 		return err
 	}
 	p.ProductAudit.Record(plan, proof, true, "durable proof accepted")
@@ -211,7 +214,7 @@ func (p *Plant) AcquireReflux(owner string, amount float64) (model.Lease, error)
 	current := p.Campaign.Snapshot()
 	lease, err := p.Reflux.Acquire(owner, amount, current.Fencing)
 	if err != nil {
-		p.Incidents.Open("reflux-capacity", err.Error(), current.Revision.String())
+		p.reportOperation(err, "reflux-capacity", Operation{Kind: OpRefluxLease, Detail: owner, Amount: amount})
 		return model.Lease{}, err
 	}
 	p.Leases.Put(lease)
@@ -232,8 +235,7 @@ func (p *Plant) Shutdown(ctx context.Context, reliefTimeout bool) (relief.Shutdo
 	result := relief.CombineShutdown(reliefErr, steamErr, p.Relief.State.Snapshot(), p.Reboiler.ClosureConfirmed(current.Epoch))
 	p.ReliefHistory.Record(p.Relief.State.Snapshot(), reliefErr)
 	if err := result.Error(); err != nil {
-		p.Incidents.Open("shutdown", err.Error(), current.Revision.String())
-		p.fail(err)
+		p.reportOperation(err, "shutdown", Operation{Kind: OpShutdown, Detail: result.Failure()})
 		return result, err
 	}
 	p.Campaign.Stop()
@@ -310,8 +312,21 @@ func (p *Plant) observeFeed(value feed.Transition) {
 }
 
 func (p *Plant) fail(err error) {
+	p.reportOperation(err, "runtime", Operation{Kind: OpRuntime})
+}
+
+// reportOperation 记录最近错误并把告警（含受阻操作上下文）关联到对应批次修订。
+func (p *Plant) reportOperation(err error, kind string, op Operation) {
+	if err == nil {
+		return
+	}
 	p.mu.Lock()
 	p.lastError = err.Error()
 	p.mu.Unlock()
-	p.Incidents.Open("runtime", err.Error(), p.Campaign.Snapshot().Revision.String())
+	p.Incidents.Report(ReportInput{
+		Kind:      kind,
+		Message:   err.Error(),
+		Revision:  p.Campaign.Snapshot().Revision.String(),
+		Operation: op,
+	})
 }

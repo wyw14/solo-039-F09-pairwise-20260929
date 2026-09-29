@@ -9,6 +9,8 @@ func (s *Server) routes() {
 	s.router.Get("/api/equipment", s.equipment)
 	s.router.Get("/api/interlocks", s.interlocks)
 	s.router.Get("/api/incidents", s.incidents)
+	s.router.Get("/api/incidents/{id}", s.incident)
+	s.router.Post("/api/incidents/{id}/resolve", s.resolveIncident)
 	s.router.Post("/api/campaign/start", s.start)
 	s.router.Post("/api/campaign/transition", s.transition)
 	s.router.Post("/api/analyzer/samples", s.sample)

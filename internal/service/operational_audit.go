@@ -300,7 +300,7 @@ func (p *Plant) OperationalAudit() map[string]any {
 	p.mu.RUnlock()
 	incidentRegistry := NewIncidents()
 	incident := incidentRegistry.Open("operational-audit", incidentMessage, revision)
-	incidentResolved := incidentRegistry.Resolve(incident.ID)
+	_, incidentResolved := incidentRegistry.ResolveWithReview(incident.ID, []ReviewCheck{{Name: "operational-audit", Passed: true, Detail: "self check"}})
 
 	return map[string]any{
 		"analyzer":  map[string]any{"compatible": analyzer.Compatible(analyzerRecovery, analyzerRecovery.Calibration, analyzerRecovery.FeedRevision), "proof": analyzerProofOK, "quality_error": auditError(qualityErr), "quality_proof_error": auditError(qualityProofErr), "last_proof": analyzerClone.LastProof(), "catalog_count": analyzerCatalog.Count(revision)},
