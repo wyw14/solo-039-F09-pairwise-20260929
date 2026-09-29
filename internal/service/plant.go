@@ -18,6 +18,8 @@ import (
 	"github.com/wyw14/solo-039/internal/relief"
 	"github.com/wyw14/solo-039/internal/utility"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -119,7 +121,10 @@ func (p *Plant) Start(ctx context.Context, grade, source string) (model.Campaign
 	p.CampaignHistory.Record(before, current, "start grade selected")
 	if err := p.Feed.Switch(ctx, source, current); err != nil {
 		operationErr = err
-		p.fail(err)
+		p.fail(KindFeedSwitch, err, BlockedOperationInput{
+			Name: opNameFeedSwitch, Class: OpFeedSwitch, Message: err.Error(),
+			Params: map[string]string{"context": "start", "source": source},
+		})
 		return model.Campaign{}, err
 	}
 	p.Column.SetFeedRevision(p.Feed.Current.Revision)
@@ -127,7 +132,7 @@ func (p *Plant) Start(ctx context.Context, grade, source string) (model.Campaign
 	p.Campaign.Advance(model.Warming)
 	if err := p.Reboiler.Ramp(ctx, p.Campaign.Snapshot(), 0.5); err != nil {
 		operationErr = err
-		p.fail(err)
+		p.fail(KindReboilerRamp, err, BlockedOperationInput{Name: opNameReboilerRamp, Class: OpReboilerRamp, Message: err.Error()})
 		return model.Campaign{}, err
 	}
 	p.Campaign.Advance(model.Stabilizing)
@@ -136,7 +141,7 @@ func (p *Plant) Start(ctx context.Context, grade, source string) (model.Campaign
 	_ = p.Profile.Put(column.TrayReading{Tray: 20, Temperature: 82, Pressure: 0.9})
 	p.ReboilerTelemetry.Record(p.Reboiler.Snapshot())
 	if err := p.record("plant.started", source); err != nil {
-		p.fail(err)
+		p.fail(KindJournal, err, BlockedOperationInput{Name: opNameJournalPersist, Class: OpJournal, Message: err.Error()})
 		operationErr = err
 		return model.Campaign{}, err
 	}
@@ -154,14 +159,17 @@ func (p *Plant) Transition(ctx context.Context, grade, source string) (model.Cam
 	campaign.Restore(p.Campaign, current)
 	p.CampaignHistory.Record(before, current, "grade transition")
 	if err := p.Feed.Switch(ctx, source, current); err != nil {
-		p.fail(err)
+		p.fail(KindFeedSwitch, err, BlockedOperationInput{
+			Name: opNameFeedSwitch, Class: OpFeedSwitch, Message: err.Error(),
+			Params: map[string]string{"context": "transition", "source": source},
+		})
 		return model.Campaign{}, err
 	}
 	p.Column.SetFeedRevision(p.Feed.Current.Revision)
 	p.FeedMetrics.Record(source)
 	p.Analyzer.BindFeed(p.Feed.Current.Revision)
 	if err := p.record("campaign.transition", grade); err != nil {
-		p.fail(err)
+		p.fail(KindJournal, err, BlockedOperationInput{Name: opNameJournalPersist, Class: OpJournal, Message: err.Error()})
 		return model.Campaign{}, err
 	}
 	return p.Campaign.Snapshot(), nil
@@ -185,33 +193,60 @@ func (p *Plant) CalibrateAnalyzer() uuid.UUID {
 
 func (p *Plant) RouteProduct(target string) error {
 	current := p.Campaign.Snapshot()
+	blocked := func(err error, params map[string]string) error {
+		if params == nil {
+			params = map[string]string{}
+		}
+		params["target"] = target
+		p.noteError(err)
+		p.reportIncident(KindProductRoute, err.Error(), current.Revision.String(), BlockedOperationInput{
+			Name: opNameProductRoute, Class: OpProductRoute, Message: err.Error(), Params: params,
+		})
+		return err
+	}
 	proof, ok := p.Analyzer.Proof(current.Revision)
 	if !ok {
-		return errors.New("composition evidence is incomplete")
+		return blocked(errors.New("composition evidence is incomplete"), nil)
 	}
 	_ = p.Evidence.Add(proof)
 	pressureProof := model.Proof{ID: uuid.New(), Revision: current.Revision, Source: "column-pressure", Digest: fmt.Sprintf("%.3f", p.Column.Snapshot().Pressure), Durable: true, Independent: true, At: time.Now().Unix()}
 	permit := p.Interlock.Evaluate([]model.Proof{proof, pressureProof}, model.Campaign{ID: current.ID, Revision: current.Revision, Phase: model.OnSpec, Epoch: current.Epoch, Fencing: current.Fencing})
 	if err := permit.Error(); err != nil {
-		return err
+		return blocked(err, map[string]string{"reasons": strings.Join(permit.Reasons, ";")})
 	}
 	current.Phase = model.OnSpec
 	campaign.Restore(p.Campaign, current)
 	plan := model.ProductPlan{Campaign: current.ID, Revision: current.Revision, Grade: current.Grade, Target: target}
 	if err := p.Product.PublishWithProof(plan, proof); err != nil {
 		p.ProductAudit.Record(plan, proof, false, err.Error())
-		p.fail(err)
+		p.fail(KindProductRoute, err, BlockedOperationInput{
+			Name: opNameProductRoute, Class: OpProductRoute, Message: err.Error(), Params: map[string]string{"target": target},
+		})
 		return err
 	}
 	p.ProductAudit.Record(plan, proof, true, "durable proof accepted")
-	return p.record("product.routed", target)
+	if err := p.record("product.routed", target); err != nil {
+		p.fail(KindJournal, err, BlockedOperationInput{Name: opNameJournalPersist, Class: OpJournal, Message: err.Error()})
+		return err
+	}
+	return nil
 }
 
 func (p *Plant) AcquireReflux(owner string, amount float64) (model.Lease, error) {
 	current := p.Campaign.Snapshot()
 	lease, err := p.Reflux.Acquire(owner, amount, current.Fencing)
 	if err != nil {
-		p.Incidents.Open("reflux-capacity", err.Error(), current.Revision.String())
+		p.noteError(err)
+		p.reportIncident(KindRefluxCapacity, err.Error(), current.Revision.String(), BlockedOperationInput{
+			Name:    opNameRefluxLease,
+			Class:   OpRefluxLease,
+			Message: err.Error(),
+			Params: map[string]string{
+				"owner":  owner,
+				"amount": strconv.FormatFloat(amount, 'f', -1, 64),
+				"fence":  strconv.FormatUint(current.Fencing, 10),
+			},
+		})
 		return model.Lease{}, err
 	}
 	p.Leases.Put(lease)
@@ -219,6 +254,7 @@ func (p *Plant) AcquireReflux(owner string, amount float64) (model.Lease, error)
 	p.RefluxTelemetry.Record(p.RefluxState.Snapshot())
 	if err := p.record("reflux.lease", owner); err != nil {
 		p.Reflux.Release(lease)
+		p.fail(KindJournal, err, BlockedOperationInput{Name: opNameJournalPersist, Class: OpJournal, Message: err.Error()})
 		return model.Lease{}, err
 	}
 	return lease, nil
@@ -232,8 +268,21 @@ func (p *Plant) Shutdown(ctx context.Context, reliefTimeout bool) (relief.Shutdo
 	result := relief.CombineShutdown(reliefErr, steamErr, p.Relief.State.Snapshot(), p.Reboiler.ClosureConfirmed(current.Epoch))
 	p.ReliefHistory.Record(p.Relief.State.Snapshot(), reliefErr)
 	if err := result.Error(); err != nil {
-		p.Incidents.Open("shutdown", err.Error(), current.Revision.String())
-		p.fail(err)
+		ops := make([]BlockedOperationInput, 0, 2)
+		if reliefErr != nil {
+			ops = append(ops, BlockedOperationInput{
+				Name: opNameReliefShutdown, Class: OpSafetyShutdown, Message: reliefErr.Error(),
+				Params: map[string]string{"valve": "flare", "timeout": strconv.FormatBool(reliefTimeout)},
+			})
+		}
+		if steamErr != nil {
+			ops = append(ops, BlockedOperationInput{
+				Name: opNameSteamClose, Class: OpSafetyShutdown, Message: steamErr.Error(),
+				Params: map[string]string{"epoch": strconv.FormatUint(current.Epoch, 10)},
+			})
+		}
+		p.noteError(err)
+		p.reportIncident(KindShutdown, err.Error(), current.Revision.String(), ops...)
 		return result, err
 	}
 	p.Campaign.Stop()
@@ -302,16 +351,29 @@ func (p *Plant) record(kind, payload string) error {
 func (p *Plant) observeFeed(value feed.Transition) {
 	payload := fmt.Sprintf("%s:%s:%t:%.2f:%s:%t", value.Stage, value.OldSource, value.OldOpen, value.OldFlow, value.NewSource, value.NewOpen)
 	if err := p.record("feed.transition", payload); err != nil {
-		p.fail(err)
+		p.fail(KindJournal, err, BlockedOperationInput{Name: opNameFeedTransitionRecord, Class: OpJournal, Message: err.Error()})
 	}
 	if value.Stage == "new-active" {
 		p.FeedMetrics.Record(value.NewSource)
 	}
 }
 
-func (p *Plant) fail(err error) {
+// noteError 只记录最近一次错误，不开事故。
+func (p *Plant) noteError(err error) {
 	p.mu.Lock()
 	p.lastError = err.Error()
 	p.mu.Unlock()
-	p.Incidents.Open("runtime", err.Error(), p.Campaign.Snapshot().Revision.String())
+}
+
+// reportIncident 登记一条事故（重复告警自动关联到同 kind+revision 的未结事故）并写生命周期事件。
+func (p *Plant) reportIncident(kind, message, revision string, ops ...BlockedOperationInput) Incident {
+	inc := p.Incidents.Trigger(kind, revision, message, ops)
+	p.recordIncidentEvent("incident.opened", inc, nil)
+	return inc
+}
+
+// fail 记录错误并按显式给出的故障域登记事故。
+func (p *Plant) fail(kind string, err error, ops ...BlockedOperationInput) {
+	p.noteError(err)
+	p.reportIncident(kind, err.Error(), p.Campaign.Snapshot().Revision.String(), ops...)
 }

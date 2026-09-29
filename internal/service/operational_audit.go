@@ -299,8 +299,10 @@ func (p *Plant) OperationalAudit() map[string]any {
 	incidentMessage := p.lastError
 	p.mu.RUnlock()
 	incidentRegistry := NewIncidents()
-	incident := incidentRegistry.Open("operational-audit", incidentMessage, revision)
-	incidentResolved := incidentRegistry.Resolve(incident.ID)
+	incident := incidentRegistry.Trigger("operational-audit", revision, incidentMessage, nil)
+	incident, _ = incidentRegistry.Acknowledge(incident.ID, "operational-audit", "")
+	incident, incidentReviewErr := incidentRegistry.RecordReview(incident.ID, "operational-audit", nil)
+	incidentResolved := incidentReviewErr == nil && !incident.Open
 
 	return map[string]any{
 		"analyzer":  map[string]any{"compatible": analyzer.Compatible(analyzerRecovery, analyzerRecovery.Calibration, analyzerRecovery.FeedRevision), "proof": analyzerProofOK, "quality_error": auditError(qualityErr), "quality_proof_error": auditError(qualityProofErr), "last_proof": analyzerClone.LastProof(), "catalog_count": analyzerCatalog.Count(revision)},

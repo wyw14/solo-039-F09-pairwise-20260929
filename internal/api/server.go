@@ -15,6 +15,10 @@ type Server struct {
 func NewServer() *Server {
 	plant := service.NewPlant("data")
 	_ = plant.Restore()
+	return NewServerWithPlant(plant)
+}
+
+func NewServerWithPlant(plant *service.Plant) *Server {
 	s := &Server{runtime: service.NewRuntime("baseline"), plant: plant, router: chi.NewRouter()}
 	s.routes()
 	return s

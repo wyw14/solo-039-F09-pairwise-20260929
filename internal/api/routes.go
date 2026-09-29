@@ -9,6 +9,9 @@ func (s *Server) routes() {
 	s.router.Get("/api/equipment", s.equipment)
 	s.router.Get("/api/interlocks", s.interlocks)
 	s.router.Get("/api/incidents", s.incidents)
+	s.router.Get("/api/incidents/{id}", s.incidentByID)
+	s.router.Post("/api/incidents/{id}/acknowledge", s.acknowledgeIncident)
+	s.router.Post("/api/incidents/{id}/review", s.reviewIncident)
 	s.router.Post("/api/campaign/start", s.start)
 	s.router.Post("/api/campaign/transition", s.transition)
 	s.router.Post("/api/analyzer/samples", s.sample)
@@ -27,10 +30,6 @@ func (s *Server) interlocks(w http.ResponseWriter, r *http.Request) {
 	status := s.plant.Status()
 	columnState := status["column"]
 	writeJSON(w, http.StatusOK, map[string]any{"ready": s.plant.Snapshot().Column.Pressure < 2, "column": columnState})
-}
-
-func (s *Server) incidents(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"items": s.plant.Incidents.List(false)})
 }
 
 func (s *Server) start(w http.ResponseWriter, r *http.Request) {
